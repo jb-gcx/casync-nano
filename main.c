@@ -26,11 +26,27 @@ static int index_fd;
 
 static bool interactive = false;
 
+static off_t total_bytes = 0;
+static off_t skipped_bytes = 0;
+
 static int entry_cb(uint64_t offset, uint32_t len, uint8_t *id, void *arg)
 {
 	static bool have_last_id = false;
 	static uint8_t last_id[CHUNK_ID_LEN];
 	static uint8_t buf[256*1024];
+
+	total_bytes += len;
+
+	bool target_is_equal;
+	if (target_probe(target, buf, len, offset, id, &target_is_equal) < 0) {
+		u_log(ERR, "probing target failed");
+		return -1;
+	}
+
+	if (target_is_equal) {
+		skipped_bytes += len;
+		goto progress_out;
+	}
 
 	if (!have_last_id || memcmp(last_id, id, CHUNK_ID_LEN) != 0) {
 		ssize_t ret = store_get_chunk(store, id, buf, sizeof(buf));
@@ -48,6 +64,7 @@ static int entry_cb(uint64_t offset, uint32_t len, uint8_t *id, void *arg)
 		return -1;
 	}
 
+progress_out:
 	// only show progress bar when running interactively and not spamming
 	// debug information anyway
 	if (interactive && !check_loglevel(U_LOG_DEBUG)) {
@@ -277,6 +294,9 @@ int main(int argc, char **argv)
 
 	now = time_monotonic();
 	u_log(INFO, "synchronization finished after %u seconds", (unsigned int)(now - start));
+	u_log(INFO, "skipped a total of %llu bytes (%.2f%% of the input)",
+	      (unsigned long long)skipped_bytes,
+	      (double)((100.0 * skipped_bytes)/total_bytes));
 
 	store_free(store);
 

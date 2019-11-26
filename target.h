@@ -15,6 +15,7 @@ struct target {
 struct target *target_new(const char *path);
 
 int target_write(struct target *t, uint8_t *data, size_t len, off_t offset, uint8_t *id);
+int target_probe(struct target *t, uint8_t *buf, size_t len, off_t offset, uint8_t *id, bool *is_equal);
 
 static inline struct store *target_as_store(struct target *t)
 {

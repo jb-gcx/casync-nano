@@ -6,6 +6,7 @@
 #include <fcntl.h>
 
 #include "utils.h"
+#include "chunk.h"
 #include "chunker.h"
 #include "index.h"
 
@@ -51,6 +52,41 @@ int target_write(struct target *t, uint8_t *data, size_t len, off_t offset, uint
 	e = index_insert(&t->idx, offset, len, id);
 	if (!e)
 		u_log(WARN, "inserting chunk into index failed");
+
+	return 0;
+}
+
+int target_probe(struct target *t, uint8_t *buf, size_t len, off_t offset, uint8_t *id, bool *is_equal)
+{
+	u_assert(t);
+	u_assert(buf);
+	u_assert(id);
+	u_assert(is_equal);
+
+	int ret;
+	ret = preadall(t->fd, buf, len, offset);
+	if (ret < 0) {
+		u_log_errno("reading %zu byte chunk from target at offset %llu failed",
+		            len, (unsigned long long int)offset);
+		return -1;
+	}
+
+	uint8_t actual_id[CHUNK_ID_LEN];
+	chunk_calculate_id(buf, len, actual_id);
+
+	if (memcmp(id, actual_id, CHUNK_ID_LEN) != 0) {
+		*is_equal = false;
+		return 0;
+	}
+
+	*is_equal = true;
+
+	if (!index_query(&t->idx, id)) {
+		struct index_entry *e;
+		e = index_insert(&t->idx, offset, len, id);
+		if (!e)
+			u_log(WARN, "inserting chunk into index failed");
+	}
 
 	return 0;
 }
