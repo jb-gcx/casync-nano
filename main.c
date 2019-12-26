@@ -18,7 +18,7 @@
 #include "target.h"
 #include "ui.h"
 
-static struct store *store;
+static struct store *store_local, *store_remote;
 static struct target *target;
 static struct chunker_params chunker_params;
 static size_t n_entries;
@@ -26,43 +26,120 @@ static int index_fd;
 
 static bool interactive = false;
 
-static int entry_cb(uint64_t offset, uint32_t len, uint8_t *id, void *arg)
+struct {
+	size_t total_chunks;
+	size_t repeated_chunks;
+
+	size_t local_hits;
+	size_t remote_hits;
+
+	size_t inplace_hashes, inplace_hits;
+
+	off_t total_bytes, total_bytes_written;
+} sync_stats;
+
+static int sync_chunk(uint64_t offset, uint32_t len, uint8_t *id, void *arg)
 {
-	static bool have_last_id = false;
-	static uint8_t last_id[CHUNK_ID_LEN];
+	static bool have_buf_id = false;
+	static uint8_t buf_id[CHUNK_ID_LEN];
 	static uint8_t buf[256*1024];
+	bool read_before_write = true;
 
-	if (!have_last_id || memcmp(last_id, id, CHUNK_ID_LEN) != 0) {
-		ssize_t ret = store_get_chunk(store, id, buf, sizeof(buf));
-		if (ret < 0 || len != (size_t)ret) {
-			u_log(ERR, "result size %zd does not match expected length %"PRIu32, ret, len);
-			return -1;
-		}
+	(void) arg;
 
-		memcpy(last_id, id, CHUNK_ID_LEN);
-		have_last_id = true;
+	if ((size_t)len > sizeof(buf)) {
+		u_log(ERR, "chunk is too large for buffer (%zu > %zu)", (size_t)len, sizeof(buf));
+		return -1;
 	}
 
-	if (target_write(target, buf, len, offset, id) < 0) {
+	sync_stats.total_chunks++;
+	sync_stats.total_bytes += len;
+
+	// if we are writing the same entry multiple times, we can reuse the
+	// data
+	if (have_buf_id && memcmp(buf_id, id, CHUNK_ID_LEN) == 0) {
+		sync_stats.repeated_chunks++;
+
+		goto write_chunk;
+	}
+
+	// otherwise, try local stores first
+	ssize_t ret_len;
+	ret_len = store_get_chunk(store_local, id, buf, sizeof(buf));
+	if (ret_len >= 0 && (size_t)ret_len == len) {
+		memcpy(buf_id, id, CHUNK_ID_LEN);
+		have_buf_id = true;
+
+		sync_stats.local_hits++;
+
+		goto write_chunk;
+	}
+
+	// try hashing the target area to see if it already contains the data
+	// we want without downloading it first
+	if (target_calc_chunk_id(target, offset, len, buf, buf_id) == 0) {
+		sync_stats.inplace_hashes++;
+
+		if (memcmp(buf_id, id, CHUNK_ID_LEN) == 0) {
+			// chunk matches already, nothing to be done
+			sync_stats.inplace_hits++;
+			goto progress;
+		}
+	} else {
+		u_log(WARN, "calculating in-place chunk id failed");
+		have_buf_id = false;
+
+		// fall through
+	}
+
+	// last resort: download the chunk
+	ret_len = store_get_chunk(store_remote, id, buf, sizeof(buf));
+	if (ret_len >= 0 && (size_t)ret_len == len) {
+		memcpy(buf_id, id, CHUNK_ID_LEN);
+		have_buf_id = true;
+
+		// because of the above checks, we know that the target has to
+		// differ from what we want it to be, so don't check it again
+		read_before_write = false;
+
+		sync_stats.remote_hits++;
+
+		goto write_chunk;
+	}
+
+	char chunk_id_str[CHUNK_ID_STRLEN];
+	chunk_format_id(chunk_id_str, id);
+
+	u_log(ERR, "chunk %s not found in any store", chunk_id_str);
+
+	return -1;
+
+	ssize_t written;
+write_chunk:
+	written = target_write(target, buf, len, offset, id, read_before_write);
+	if (written < 0) {
 		u_log(ERR, "failed to store chunk to target");
 		return -1;
 	}
 
+	sync_stats.total_bytes_written += written;
+
+progress:
 	// only show progress bar when running interactively and not spamming
 	// debug information anyway
 	if (interactive && !check_loglevel(U_LOG_DEBUG)) {
-		static uint32_t handled_entries = 0;
 		static progess_status_t progress_status = PROGRESS_STATUS_INIT;
 
-		show_progress(100 * ++handled_entries / n_entries, &progress_status);
+		show_progress(100 * sync_stats.total_chunks / n_entries, &progress_status);
 	}
 
 	return 0;
 }
 
-static int append_store_from_arg(struct store_chain *sc, char *arg)
+static int append_store_from_arg(char *arg)
 {
 	struct store *s;
+	struct store_chain *sc;
 
 	if (startswith(arg, "http")) {
 		s = store_http_new(arg);
@@ -70,6 +147,8 @@ static int append_store_from_arg(struct store_chain *sc, char *arg)
 			u_log(ERR, "creating HTTP store from '%s' failed", arg);
 			return -1;
 		}
+
+		sc = (struct store_chain*)store_remote;
 	} else {
 		char *p = strchr(arg, ':');
 		if (p) {
@@ -82,6 +161,8 @@ static int append_store_from_arg(struct store_chain *sc, char *arg)
 			u_log(ERR, "creating local store from '%s' failed", arg);
 			return -1;
 		}
+
+		sc = (struct store_chain*)store_local;
 	}
 
 	if (store_chain_append(sc, s) < 0) {
@@ -116,23 +197,15 @@ static int csn(int argc, char **argv)
 		return -1;
 	}
 
-	struct store_chain *sc = store_chain_new(argc - 3 + 1);
-	if (!sc) {
-		u_log(ERR, "creating storechain failed");
-		return -1;
-	}
-
-	if (store_chain_append(sc, target_as_store(target)) < 0) {
+	if (store_chain_append((struct store_chain*)store_local, target_as_store(target)) < 0) {
 		u_log(ERR, "appending target to store chain failed");
 		return -1;
 	}
 
 	for (int i = 3; i < argc; i++) {
-		if (append_store_from_arg(sc, argv[i]) < 0)
+		if (append_store_from_arg(argv[i]) < 0)
 			return -1;
 	}
-
-	store = store_chain_to_store(sc);
 
 	return 0;
 }
@@ -188,14 +261,7 @@ static int casync(int argc, char **argv)
 		return -1;
 	}
 
-	// allocate (more than) enough store chain slots
-	struct store_chain *sc = store_chain_new((argc - 4) / 2 + 1);
-	if (!sc) {
-		u_log(ERR, "creating storechain failed");
-		return -1;
-	}
-
-	if (store_chain_append(sc, target_as_store(target)) < 0) {
+	if (store_chain_append((struct store_chain*)store_local, target_as_store(target)) < 0) {
 		u_log(ERR, "appending target to store chain failed");
 		return -1;
 	}
@@ -208,7 +274,7 @@ static int casync(int argc, char **argv)
 				return 0;
 			case ARG_STORE:
 			case ARG_SEED:
-				if (append_store_from_arg(sc, optarg) < 0)
+				if (append_store_from_arg(optarg) < 0)
 					return -1;
 
 				break;
@@ -230,8 +296,6 @@ static int casync(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	store = store_chain_to_store(sc);
-
 	return 0;
 }
 
@@ -239,7 +303,7 @@ int main(int argc, char **argv)
 {
 	u_log_init();
 
-	int ret;
+	int exit_code = EXIT_FAILURE;
 
 	if (isatty(STDOUT_FILENO))
 		interactive = true;
@@ -249,19 +313,32 @@ int main(int argc, char **argv)
 	now = time_monotonic();
 	time_t start = now;
 
+	int (*app)(int argc, char **argv);
 	const char *appname = basename(argv[0]);
 	if (streq(appname, "csn")) {
-		ret = csn(argc, argv);
+		app = csn;
 	} else if (streq(appname, "casync")) {
-		ret = casync(argc, argv);
+		app = casync;
 	} else {
 		u_log(ERR, "unimplemented app variant '%s'", appname);
-		return EXIT_FAILURE;
+		goto out;
 	}
 
-	if (ret) {
+	store_local = store_chain_to_store(store_chain_new(2));
+	if (!store_local) {
+		u_log(ERR, "allocating local store chain failed");
+		goto out;
+	}
+
+	store_remote = store_chain_to_store(store_chain_new(1));
+	if (!store_remote) {
+		u_log(ERR, "allocating remote store chain failed");
+		goto out_sc_local;
+	}
+
+	if (app(argc, argv)) {
 		u_log(ERR, "initializing synchronization process failed");
-		return EXIT_FAILURE;
+		goto out_sc_remote;
 	}
 
 	now = time_monotonic();
@@ -270,15 +347,29 @@ int main(int argc, char **argv)
 
 	u_log(INFO, "starting synchronization");
 
-	if (caibx_iterate_entries(index_fd, &chunker_params, n_entries, entry_cb, NULL) < 0) {
+	if (caibx_iterate_entries(index_fd, &chunker_params, n_entries, sync_chunk, NULL) < 0) {
 		u_log(ERR, "iterating entries failed");
-		return EXIT_FAILURE;
+		goto out_index;
 	}
+
+	exit_code = EXIT_SUCCESS;
 
 	now = time_monotonic();
 	u_log(INFO, "synchronization finished after %u seconds", (unsigned int)(now - start));
 
-	store_free(store);
+	u_log(INFO, " total chunks: %zu", sync_stats.total_chunks);
+	u_log(INFO, " total bytes: %zu", sync_stats.total_bytes);
+	u_log(INFO, "  total bytes written: %zu (%.2f%%)", sync_stats.total_bytes_written,
+	      100.0 * sync_stats.total_bytes_written / sync_stats.total_bytes);
+	u_log(INFO, " local/remote hits: %zu/%zu", sync_stats.local_hits, sync_stats.remote_hits);
+	u_log(INFO, " inplace hashes/hits: %zu/%zu", sync_stats.inplace_hashes, sync_stats.inplace_hits);
 
-	return EXIT_SUCCESS;
+out_index:
+	close(index_fd);
+out_sc_remote:
+	store_free(store_remote);
+out_sc_local:
+	store_free(store_local);
+out:
+	return exit_code;
 }

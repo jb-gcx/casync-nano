@@ -35,12 +35,38 @@ static ssize_t target_get_chunk(struct store *s, uint8_t *id, uint8_t *out, size
 	return e->len;
 }
 
-int target_write(struct target *t, const uint8_t *data, size_t len, off_t offset, const uint8_t *id)
+int target_calc_chunk_id(struct target *t, off_t offset, size_t len, uint8_t *data_out, uint8_t *id_out)
+{
+	if (preadall(t->fd, data_out, len, offset) < 0) {
+		u_log(ERR, "reading chunk failed");
+		return -1;
+	}
+
+	chunk_calculate_id(data_out, len, id_out);
+
+	return 0;
+}
+
+ssize_t target_write(struct target *t, const uint8_t *data, size_t len, off_t offset, const uint8_t *id, bool read_before_write)
 {
 	u_assert(t);
 	u_assert(id);
 
 	int ret;
+
+	// FIXME: implement this properly
+	if (read_before_write) {
+		static uint8_t rbuf[256*1024];
+
+		ret = preadall(t->fd, rbuf, len, offset);
+		if (ret < 0) {
+			u_log_errno("reading %zu bytes before writing to target failed", len);
+		} else {
+			if (memcmp(rbuf, data, len) == 0)
+				return 0;
+		}
+	}
+
 	ret = pwriteall(t->fd, data, len, offset);
 	if (ret < 0) {
 		u_log_errno("writing %zu bytes to target failed", len);
@@ -55,7 +81,7 @@ int target_write(struct target *t, const uint8_t *data, size_t len, off_t offset
 			u_log(WARN, "inserting chunk into index failed");
 	}
 
-	return 0;
+	return len;
 }
 
 struct target *target_new(const char *path)

@@ -56,8 +56,6 @@ static ssize_t store_chain_get_chunk(struct store *s, uint8_t *id, uint8_t *out,
 		}
 	}
 
-	u_log(WARN, "chunk %s not found in any store", chunk_name);
-
 	return 0;
 }
 
