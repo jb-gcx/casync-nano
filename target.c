@@ -44,10 +44,28 @@ int target_write(struct target *t, const uint8_t *data, size_t len, off_t offset
 	u_assert(id);
 
 	int ret;
-	ret = pwriteall(t->fd, data, len, offset);
-	if (ret < 0) {
-		u_log_errno("writing %zu bytes to target failed", len);
-		return -1;
+
+	if (t->seekable) {
+		ret = pwriteall(t->fd, data, len, offset);
+		if (ret < 0) {
+			u_log_errno("writing %zu bytes to target failed", len);
+			return -1;
+		}
+	} else {
+		if (offset != t->offset) {
+			u_log(ERR, "tried to write to offset %llu in non-seekable target currently at offset %llu",
+			      (unsigned long long)offset,
+			      (unsigned long long)t->offset);
+			return -1;
+		}
+
+		ret = writeall(t->fd, data, len);
+		if (ret < 0) {
+			u_log_errno("writing %zu bytes to target failed", len);
+			return -1;
+		}
+
+		t->offset += len;
 	}
 
 	if (!t->queryable)
@@ -77,6 +95,11 @@ struct target *target_new(const char *path)
 		u_log_errno("opening target '%s' failed", path);
 		goto err_target;
 	}
+
+	t->seekable = true;
+	t->offset = 0;
+	if (lseek(t->fd, t->offset, SEEK_SET) < 0)
+		t->seekable = false;
 
 	snprintf(t->s.name, sizeof(t->s.name), "target:%s", path);
 	t->s.get_chunk = target_get_chunk;
