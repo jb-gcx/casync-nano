@@ -90,13 +90,17 @@ struct target *target_new(const char *path)
 	t->s.free = NULL;
 
 	off_t size;
-	checked(fd_size(t->fd, &size), goto err_fd);
+	size_t chunk_estimate = 0;
+	if (fd_size(t->fd, &size) == 0) {
+		/* We don't want to pollute the API with chunker parameters here. Let's
+		 * just use the default as a reasonable estimate.
+		 */
+		chunk_estimate  = (12ull * size/CHUNKER_SIZE_AVG_DEFAULT) / 10;
+		u_log(DEBUG, "initializing index with an estimated %zu chunks", chunk_estimate);
+	} else {
+		u_log(WARN, "could not determine target size");
+	}
 
-	/* We don't want to pollute the API with chunker parameters here. Let's
-	 * just use the default as a reasonable estimate.
-	 */
-	size_t chunk_estimate = (12ull * size/CHUNKER_SIZE_AVG_DEFAULT) / 10;
-	u_log(DEBUG, "initializing index with an estimated %zu chunks", chunk_estimate);
 	if (index_init(&t->idx, chunk_estimate) < 0) {
 		u_log(ERR, "initializing index failed");
 		goto err_fd;
