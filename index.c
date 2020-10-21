@@ -7,7 +7,9 @@
 int index_init(struct index *idx, size_t expected_size)
 {
 	u_assert(idx);
-	u_assert(expected_size > 0);
+
+	if (expected_size == 0)
+		expected_size = 1;
 
 	idx->entries = calloc(expected_size, sizeof(*idx->entries));
 	u_notnull(idx->entries, return -1);
